@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "immich-metadata-update"
+version = "2.0.0"
+description = "Update Immich asset dates based on filenames"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "requests>=2.28",
+]
+
+[project.scripts]
+immich-metadata-update = "immich_metadata_update.__main__:main"

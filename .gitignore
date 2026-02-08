@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.env
+corrections.json
+decisions.json
+*.txt
+!requirements.txt
