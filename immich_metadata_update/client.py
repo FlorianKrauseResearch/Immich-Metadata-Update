@@ -18,6 +18,10 @@ VISIBILITIES_NO_LOCKED = ("timeline", "archive", "hidden")
 DEFAULT_PAGE_SIZE = 100
 
 
+class AlbumFilterUnsupportedError(RuntimeError):
+    """Raised when the server cannot safely perform an album-filtered search."""
+
+
 class ImmichClient:
     """HTTP client for the Immich API.
 
@@ -32,6 +36,8 @@ class ImmichClient:
         self.session = self._build_session(api_key)
         self._locked_session: requests.Session | None = None
         self._session_unlocked = False
+        self._supports_structured_search: bool | None = None
+        self._server_version: tuple[int, int] | None = None
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -175,17 +181,56 @@ class ImmichClient:
     # Fetch assets
     # ------------------------------------------------------------------
 
+    def supports_structured_search(self) -> bool:
+        """Return whether the server supports the v3.2 search request shape."""
+        if self._supports_structured_search is not None:
+            return self._supports_structured_search
+
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/api/server/version", timeout=self.timeout
+            )
+            resp.raise_for_status()
+            version = resp.json()
+            major = int(version["major"])
+            minor = int(version["minor"])
+        except (KeyError, TypeError, ValueError, requests.RequestException) as exc:
+            logger.error("Could not determine Immich version: %s", exc)
+            self._supports_structured_search = False
+            return False
+
+        self._server_version = (major, minor)
+        self._supports_structured_search = (major, minor) >= (3, 2)
+        return self._supports_structured_search
+
     def fetch_assets(
         self,
         include_locked: bool = False,
         page_size: int = DEFAULT_PAGE_SIZE,
+        album_id: str | None = None,
     ) -> list[Asset]:
         """Fetch all assets across visibility scopes.
 
         The locked folder is only included when *include_locked* is True
         (requires a prior call to login_and_unlock).
+        When *album_id* is provided, only assets in that album are requested
+        from Immich.
         Paginates automatically and deduplicates by asset id.
         """
+        if album_id and not self.supports_structured_search():
+            if self._server_version:
+                version = ".".join(map(str, self._server_version))
+                message = (
+                    "Album filtering requires Immich v3.2 or newer; "
+                    f"server version is v{version}."
+                )
+            else:
+                message = (
+                    "Album filtering requires Immich v3.2 or newer, but the "
+                    "server version could not be determined."
+                )
+            raise AlbumFilterUnsupportedError(message)
+
         visibilities = VISIBILITIES if include_locked else VISIBILITIES_NO_LOCKED
         seen_ids: set[str] = set()
         assets: list[Asset] = []
@@ -198,7 +243,12 @@ class ImmichClient:
                 if visibility == "locked" and self._locked_session
                 else self.session
             )
-            for asset in self._fetch_visibility(visibility, page_size, session):
+            for asset in self._fetch_visibility(
+                visibility,
+                page_size,
+                session,
+                album_id,
+            ):
                 if asset.id not in seen_ids:
                     seen_ids.add(asset.id)
                     assets.append(asset)
@@ -207,14 +257,30 @@ class ImmichClient:
         return assets
 
     def _fetch_visibility(
-        self, visibility: str, page_size: int, session: requests.Session,
+        self,
+        visibility: str,
+        page_size: int,
+        session: requests.Session,
+        album_id: str | None,
     ) -> Iterator[Asset]:
         """Yield assets for a single visibility scope, handling pagination."""
         url = f"{self.base_url}/api/search/metadata"
         page = 1
+        cursor: str | None = None
 
         while True:
-            payload = {"size": page_size, "page": page, "visibility": visibility}
+            if album_id:
+                payload = {
+                    "size": page_size,
+                    "filter": {
+                        "albumIds": {"any": [album_id]},
+                        "visibility": {"eq": visibility},
+                    },
+                }
+                if cursor:
+                    payload["cursor"] = cursor
+            else:
+                payload = {"size": page_size, "page": page, "visibility": visibility}
 
             try:
                 resp = session.post(url, json=payload, timeout=self.timeout)
@@ -225,7 +291,8 @@ class ImmichClient:
                 )
                 break
 
-            items = resp.json().get("assets", {}).get("items", [])
+            assets_response = resp.json().get("assets", {})
+            items = assets_response.get("items", [])
             if not items:
                 break
 
@@ -237,9 +304,48 @@ class ImmichClient:
             logger.debug(
                 "Fetched page %d of '%s' (%d items)", page, visibility, len(items)
             )
+            if album_id:
+                cursor = assets_response.get("nextCursor")
+                if not cursor:
+                    break
             page += 1
 
         logger.info("Finished fetching '%s' assets", visibility)
+
+    def get_album_id(self, album_name: str) -> str | None:
+        """Return the ID of an album with an exact name match."""
+        url = f"{self.base_url}/api/albums"
+
+        try:
+            resp = self.session.get(
+                url, params={"name": album_name}, timeout=self.timeout
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            if getattr(exc.response, "status_code", None) == 403:
+                logger.error(
+                    "API key is not allowed to read albums. Create or update the "
+                    "key with album read permission."
+                )
+            else:
+                logger.error("Could not find album %r: %s", album_name, exc)
+            return None
+
+        albums = resp.json()
+        if not isinstance(albums, list):
+            logger.error("Unexpected response while looking up album %r", album_name)
+            return None
+
+        matches = [
+            album.get("id")
+            for album in albums
+            if album.get("albumName") == album_name and album.get("id")
+        ]
+        if len(matches) != 1:
+            logger.error("Expected one album named %r, found %d", album_name, len(matches))
+            return None
+
+        return matches[0]
 
     # ------------------------------------------------------------------
     # Update assets

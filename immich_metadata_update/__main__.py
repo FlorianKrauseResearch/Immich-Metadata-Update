@@ -11,7 +11,7 @@ from datetime import date
 from pathlib import Path
 
 from . import __version__
-from .client import ImmichClient
+from .client import AlbumFilterUnsupportedError, ImmichClient
 from .filters import BUILTIN_PATTERNS, find_mismatched_assets
 
 logger = logging.getLogger("immich_metadata_update")
@@ -111,6 +111,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Immich account password, needed for locked folder access (env: IMMICH_PASSWORD)."
         ),
     )
+    conn.add_argument(
+        "--album",
+        default=os.getenv("IMMICH_ALBUM", ""),
+        help=(
+            "Only scan assets in this exact Immich album name "
+            "(env: IMMICH_ALBUM)."
+        ),
+    )
 
     # Pattern selection
     pat = parser.add_argument_group("pattern")
@@ -169,6 +177,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-auto-skip",
+        action="store_true",
+        help=(
+            "Keep suspicious entries in the review file with skip: false. "
+            "Does not apply changes."
+        ),
+    )
+    parser.add_argument(
         "--decisions-file",
         type=Path,
         default=None,
@@ -197,17 +213,29 @@ def list_presets() -> None:
         print()
 
 
-def resolve_pattern(args: argparse.Namespace) -> tuple[str, str]:
-    """Return (regex, date_format) from CLI arguments."""
+def resolve_patterns(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Return the filename patterns selected by CLI arguments."""
     if args.preset:
         pat = BUILTIN_PATTERNS[args.preset]
-        return pat.regex, pat.date_format
+        return [(pat.regex, pat.date_format)]
 
-    if args.regex and args.date_format:
-        return args.regex, args.date_format
+    if args.regex or args.date_format:
+        if args.regex and args.date_format:
+            return [(args.regex, args.date_format)]
+        print(
+            "Error: --regex and --date-format must be provided together.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.album:
+        return [
+            (pattern.regex, pattern.date_format)
+            for pattern in BUILTIN_PATTERNS.values()
+        ]
 
     print(
-        "Error: provide either --preset or both --regex and --date-format.\n"
+        "Error: provide --album, --preset, or both --regex and --date-format.\n"
         "Run with --list-presets to see built-in options.",
         file=sys.stderr,
     )
@@ -278,16 +306,18 @@ def record_decisions(
 # ---------------------------------------------------------------------------
 
 
-def export_corrections(corrected, export_path: Path) -> None:
+def export_corrections(
+    corrected,
+    export_path: Path,
+    no_auto_skip: bool = False,
+) -> None:
     """Write the corrections list to a human-editable JSON file.
 
     Each entry includes a "skip" field (default false) that the user
     can set to true to exclude individual assets from being updated.
 
-    Entries where the filename date is *after* the original date are
-    flagged with a "warning" and auto-skipped, since this usually means
-    the original date is already correct (e.g. a forwarded WhatsApp image
-    whose filename reflects the forwarding date, not the capture date).
+    Entries where the filename date is *after* the original date are flagged
+    with a "warning" and auto-skipped, unless *no_auto_skip* is enabled.
     """
     export_data = []
     warn_count = 0
@@ -303,24 +333,38 @@ def export_corrections(corrected, export_path: Path) -> None:
             "location": c.asset.visibility.capitalize(),
             "originalDate": c.asset.creation_date.isoformat(),
             "correctedDate": c.corrected_date_str,
-            "skip": is_suspicious,
+            "skip": is_suspicious and not no_auto_skip,
         }
         if is_suspicious:
-            entry["warning"] = (
-                "Filename date is AFTER the original date — "
-                "the original is likely correct. Auto-skipped."
-            )
+            if no_auto_skip:
+                entry["warning"] = (
+                    "Date safety check disabled; filename date is AFTER the "
+                    "original date."
+                )
+            else:
+                entry["warning"] = (
+                    "Filename date is AFTER the original date — "
+                    "the original is likely correct. Auto-skipped."
+                )
 
         export_data.append(entry)
 
     export_path.write_text(json.dumps(export_data, indent=2))
     logger.info("Wrote %d entries to %s", len(export_data), export_path)
     if warn_count:
-        logger.warning(
-            "%d entries have a filename date AFTER the original date "
-            "and were auto-skipped. Review them in %s.",
-            warn_count, export_path,
-        )
+        if no_auto_skip:
+            logger.warning(
+                "%d entries have a filename date AFTER the original date and "
+                "were not auto-skipped because --no-auto-skip was used. Review "
+                "them in %s.",
+                warn_count, export_path,
+            )
+        else:
+            logger.warning(
+                "%d entries have a filename date AFTER the original date "
+                "and were auto-skipped. Review them in %s.",
+                warn_count, export_path,
+            )
 
 
 def load_corrections(apply_path: Path) -> list[dict]:
@@ -397,6 +441,9 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         _run(args, client, decisions, decisions_path, include_locked)
+    except AlbumFilterUnsupportedError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
     finally:
         # Always re-lock and log out if we unlocked
         client.lock_and_logout()
@@ -466,7 +513,7 @@ def _run(
         return
 
     # ----- Mode B: scan library ---------------------------------------------
-    regex, date_format = resolve_pattern(args)
+    patterns = resolve_patterns(args)
 
     if not include_locked:
         logger.info(
@@ -476,13 +523,28 @@ def _run(
     else:
         logger.info("Fetching assets from %s (including locked folder) …", args.url)
 
-    assets = client.fetch_assets(include_locked=include_locked)
+    album_id = None
+    if args.album:
+        album_id = client.get_album_id(args.album)
+        if not album_id:
+            print(f"Error: no unique album found with name {args.album!r}.", file=sys.stderr)
+            sys.exit(1)
+        logger.info("Limiting scan to album %r.", args.album)
+
+    assets = client.fetch_assets(
+        include_locked=include_locked,
+        album_id=album_id,
+    )
 
     if not assets:
         logger.warning("No assets found — nothing to do.")
         return
 
-    corrected = find_mismatched_assets(assets, regex, date_format)
+    corrected_by_id = {}
+    for regex, date_format in patterns:
+        for corrected_asset in find_mismatched_assets(assets, regex, date_format):
+            corrected_by_id.setdefault(corrected_asset.asset.id, corrected_asset)
+    corrected = list(corrected_by_id.values())
 
     if not corrected:
         logger.info("All matching assets already have the correct date.")
@@ -506,11 +568,15 @@ def _run(
 
     # Write the corrections file for review
     export_path = args.export or DEFAULT_EXPORT_FILE
-    export_corrections(corrected, export_path)
+    export_corrections(corrected, export_path, no_auto_skip=args.no_auto_skip)
 
     for c in corrected:
         is_suspicious = c.filename_date > c.asset.creation_date.date()
-        prefix = "⚠ SKIPPED " if is_suspicious else "  "
+        prefix = (
+            "⚠ WARNING " if is_suspicious and args.no_auto_skip
+            else "⚠ SKIPPED " if is_suspicious
+            else "  "
+        )
         logger.info(
             "%s%-10s %s  %s → %s",
             prefix,
@@ -522,7 +588,7 @@ def _run(
 
     skipped = sum(
         1 for c in corrected
-        if c.filename_date > c.asset.creation_date.date()
+        if c.filename_date > c.asset.creation_date.date() and not args.no_auto_skip
     )
     to_apply = len(corrected) - skipped
 

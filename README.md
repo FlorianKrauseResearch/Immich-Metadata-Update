@@ -139,6 +139,13 @@ To exclude an asset, either **delete the row** or set `"skip": true`:
 
 > **Auto-skipped entries:** If the filename date is *after* the original date, the entry is automatically marked `"skip": true` with a `"warning"` explaining why. This typically happens with forwarded WhatsApp images — the filename reflects when the image was forwarded, not when it was taken, so the original date is already correct. You can override this by setting `"skip": false` if you know the correction is right.
 
+To keep these entries as `"skip": false` from the start, use `--no-auto-skip` when scanning. They still receive a warning that the date safety check was disabled, and are only changed after the separate `--apply` command:
+
+```bash
+python run.py --album 1979 --no-auto-skip
+python run.py --apply corrections.json
+```
+
 ### Step 3: Apply the corrections
 
 ```bash
@@ -171,6 +178,19 @@ Write corrections to a custom file:
 python run.py --preset whatsapp --export my_review.json
 python run.py --apply my_review.json
 ```
+
+Only scan images from an Immich album (use its exact name):
+
+```bash
+python run.py --album 1979
+```
+
+The album can also be configured with `IMMICH_ALBUM` in `.env`. The scan stops
+with an error when no album, or more than one album, has that exact name.
+The API key must have permission to read albums. Album filtering requires Immich
+v3.2 or newer. Without `--preset` or a custom
+`--regex`/`--date-format`, every built-in filename pattern is tried for the
+album. Specify a preset or custom pattern to restrict the matching rule.
 
 ### Decision history (running the script again later)
 
